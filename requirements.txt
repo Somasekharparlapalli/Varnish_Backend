@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+tensorflow
+opencv-python
+ai-edge-litert
+fastapi-mail
+numpy
+pymysql

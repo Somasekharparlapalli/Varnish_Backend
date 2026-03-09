@@ -1,0 +1,18 @@
+{
+    "sourceFile": "dataset/models/teeth_model.tflite",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1772773184440,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1772773184440,
+            "name": "Commit-0",
+            "content": "c:\\Users\\somasekhar reddy\\Downloads\\teeth_model (1).tflite"
+        }
+    ]
+}
