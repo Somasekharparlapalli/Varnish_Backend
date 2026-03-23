@@ -63,7 +63,18 @@ async def scan(
         shutil.copyfileobj(file.file, buffer)
 
     # Re-open for AI processing
+    from PIL import ImageFilter
     image = Image.open(img_path).convert("RGB")
+    
+    # 1. Blurry Detection using Edge Variance
+    gray = image.convert('L')
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    variance = np.var(np.array(edges))
+    if variance < 80: # Threshold for extreme blur/flat image
+        # Return HTTP 400 for bad image
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Invalid Image: Extremely blurry or not a clear teeth image.")
+
     image = image.resize((224,224))
 
     img = np.array(image)/255.0
@@ -71,6 +82,10 @@ async def scan(
 
     prediction = model.predict(img)[0]
     confidence = float(np.max(prediction))*100
+
+    if confidence < 70.0:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Invalid Image: AI could not recognize caries confidence.")
 
     class_idx = np.argmax(prediction)
     age_group = age_groups[class_idx]
