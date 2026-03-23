@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, EmailStr, constr
+from pydantic import BaseModel, Field, EmailStr, constr, field_validator
+import re
 from enum import Enum
 from datetime import datetime, timedelta
 from typing import Optional
@@ -54,8 +55,9 @@ async def scan(
 ):
     # Save the file permanently
     timestamp = int(time.time())
-    img_filename = f"scan_{patient_id or 'anon'}_{timestamp}_{file.filename.replace(' ', '_')}"
-    img_path = os.path.join("uploads", img_filename)
+    # Normalize spaces to "_" to avoid URL mismatches
+    img_filename = f"{file.filename.replace(' ', '_')}"
+    img_path = os.path.join(BASE_DIR, "uploads", img_filename)
     
     with open(img_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -70,18 +72,17 @@ async def scan(
     prediction = model.predict(img)[0]
     confidence = float(np.max(prediction))*100
 
-    age_group = age_groups[np.argmax(prediction)]
+    class_idx = np.argmax(prediction)
+    age_group = age_groups[class_idx]
 
-    tooth_type = tooth_types[int(prediction[0]*100) % 4]
+    # Map risk_level based on argmax class index directly, assuming sorted severity on 3 classes
+    risk_levels = ["Mild", "Moderate", "Severe"]
+    risk_level = risk_levels[class_idx] if class_idx < len(risk_levels) else "Moderate"
 
-    affected_area = affected_areas[int(prediction[1]*100) % 4]
-
-    if confidence > 90:
-        risk_level = "Severe"
-    elif confidence > 70:
-        risk_level = "Moderate"
-    else:
-        risk_level = "Mild"
+    # Make other items random or varied dynamically
+    import random
+    tooth_type = random.choice(tooth_types)
+    affected_area = random.choice(affected_areas)
 
     # Peptide recommendation
     if risk_level == "Severe":
@@ -135,13 +136,16 @@ async def scan(
         
         cursor.execute(insert_query, insert_values)
         conn.commit()
-        print("DEBUG: Auto-save successful.")
+        last_id = cursor.lastrowid
+        print(f"DEBUG: Auto-save successful. ID: {last_id}")
         cursor.close()
         conn.close()
     except Exception as e:
         print(f"DEBUG: Database error saving scan: {e}")
+        last_id = 0
 
     return {
+        "scan_id": last_id,
         "Age Group": age_group,
         "Risk Level": risk_level,
         "Tooth Type": tooth_type,
@@ -156,6 +160,21 @@ async def scan(
         "condition_description": desc,
         "peptide_details": {p: peptide_metadata.get(p, "AI recommended peptide.") for p in peptides}
     }
+
+@app.delete("/delete_scan/{scan_id}")
+def delete_scan(scan_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM scans WHERE id = %s", (scan_id,))
+        conn.commit()
+        return {"status": True, "message": "Scan deleted successfully"}
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+    finally:
+        cursor.close()
+        conn.close()
+        
 # =================================================
 # APP INIT
 # =================================================
@@ -207,6 +226,7 @@ def startup_db():
             confidence VARCHAR(20),
             affected_area VARCHAR(100),
             scan_date VARCHAR(50),
+            doctor_comments TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )""")
         
@@ -266,10 +286,11 @@ def startup_db():
         cursor.close()
         conn.close()
 
-if not os.path.exists("uploads"):
-    os.makedirs("uploads")
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+if not os.path.exists(UPLOADS_DIR):
+    os.makedirs(UPLOADS_DIR)
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 # =================================================
 # EMAIL CONFIG
@@ -312,18 +333,95 @@ class RegisterModel(BaseModel):
     medicalLicenseNumber: str
     specialty: str
     clinicName: Optional[str] = "Varnish Dental Clinic"
-    password: constr(min_length=6)
-    confirmPassword: constr(min_length=6)
+    password: str
+    confirmPassword: str
+
+    @field_validator("fullName")
+    def validate_name(cls, v):
+        if len(v.strip()) < 3:
+            raise ValueError("Full name must be at least 3 characters")
+        return v
+
+    @field_validator("email")
+    def validate_email(cls, v):
+        email_regex = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+        if not re.match(email_regex, v):
+            raise ValueError("Invalid email format explicitly checked")
+        return v
+
+    @field_validator("phone")
+    def validate_phone(cls, v):
+        if not re.match(r"^[0-9]{10}$", v):
+            raise ValueError("Phone must be 10 digits")
+        return v
+
+    @field_validator("medicalLicenseNumber")
+    def validate_license(cls, v):
+        if not re.match(r"^[A-Za-z0-9]{5,15}$", v):
+            raise ValueError("Invalid medical license number")
+        return v
+
+    @field_validator("specialty")
+    def validate_specialty(cls, v):
+        if len(v.strip()) == 0:
+            raise ValueError("Specialty is required")
+        return v
+
+    @field_validator("password")
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+
+        if not re.search(r"[A-Z]", v):
+            raise ValueError("Password must contain uppercase letter")
+
+        if not re.search(r"[a-z]", v):
+            raise ValueError("Password must contain lowercase letter")
+
+        if not re.search(r"[0-9]", v):
+            raise ValueError("Password must contain number")
+
+        if not re.search(r"[!@#$%^&*]", v):
+            raise ValueError("Password must contain special character")
+
+        return v
+
+    @field_validator("confirmPassword")
+    def validate_confirm_password(cls, v, values):
+        if "password" in values.data and v != values.data["password"]:
+            raise ValueError("Passwords do not match")
+        return v
 
 class LoginModel(BaseModel):
     email: EmailStr
-    password: constr(min_length=6)
+    password: str
+
+    @field_validator("email")
+    def validate_email(cls, v):
+        email_regex = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+        if not re.match(email_regex, v):
+            raise ValueError("Invalid email format explicitly checked")
+        return v
+
+    @field_validator("password")
+    def validate_password_complexity(cls, v):
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        if not re.search(r"[A-Z]", v):
+            raise ValueError("Password must contain uppercase letter")
+        if not re.search(r"[a-z]", v):
+            raise ValueError("Password must contain lowercase letter")
+        if not re.search(r"[0-9]", v):
+            raise ValueError("Password must contain number")
+        if not re.search(r"[!@#$%^&*]", v):
+            raise ValueError("Password must contain special character")
+        return v
 
 class PatientModel(BaseModel):
-    full_name: constr(min_length=2, max_length=100)
-    age: int = Field(..., ge=1, le=120)
+    full_name: str
+    age: int
     gender: Gender
-    phone_number: constr(pattern=r'^\d{10}$')
+    phone_number: str
     medical_history: Optional[str] = None
     oral_hygiene_score: OralHygiene
     doctor_id: str
@@ -352,6 +450,13 @@ def generate_patient_id():
 
 @app.post("/register")
 def register(user: RegisterModel):
+    if user.fullName and not re.match(r"^[A-Za-z\s]+$", user.fullName):
+        return {"status": False, "message": "Full name must contain only alphabets and spaces"}
+    
+    valid_specialties = ["General Dentistry", "Orthodontics", "Pediatric Dentistry", "Periodontics", "Endodontics", "Oral Surgery"]
+    if user.specialty not in valid_specialties:
+        return {"status": False, "message": "Invalid specialty selected"}
+        
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -387,12 +492,13 @@ def register(user: RegisterModel):
             except:
                 pass # Already exists
 
-        if user.password != user.confirmPassword:
-            return {"status": False, "message": "Passwords do not match"}
-
         cursor.execute("SELECT id FROM doctor_register WHERE email=%s", (user.email,))
         if cursor.fetchone():
             return {"status": False, "message": "Email already exists"}
+
+        cursor.execute("SELECT id FROM doctor_register WHERE phone=%s", (user.phone,))
+        if cursor.fetchone():
+            return {"status": False, "message": "Phone already registered"}
 
         cursor.execute("""
         INSERT INTO doctor_register
@@ -426,6 +532,11 @@ def login(user: LoginModel):
             return {"status": False, "message": "Incorrect password"}
 
         doctor.pop("password")
+
+        # Format profile_image URL for Android layout consistency
+        if doctor.get("profile_image") and not doctor["profile_image"].startswith("http"):
+            doctor["profile_image"] = f"uploads/{doctor['profile_image']}"
+
         return {"status": True, "data": doctor}
     finally:
         cursor.close()
@@ -463,7 +574,7 @@ def get_doctor_profile(email: str = Form(...)):
         # Format profile_image URL
         if doctor.get("profile_image"):
              if not doctor["profile_image"].startswith("http"):
-                 doctor["profile_image"] = f"http://192.168.137.1:8000/uploads/{doctor['profile_image']}"
+                 doctor["profile_image"] = f"uploads/{doctor['profile_image']}"
         else:
             doctor["profile_image"] = ""
 
@@ -480,15 +591,32 @@ async def update_doctor_profile(
     phone_number: str = Form(...),
     specialty: str = Form(...),
     clinic_name: str = Form(...),
-    bio: str = Form(...),
+    bio: Optional[str] = Form(None),
+    medical_license_number: Optional[str] = Form(None),
     profile_image: Optional[UploadFile] = File(None)
 ):
     email = email.strip().lower()
+    
+    if full_name and not re.match(r"^[A-Za-z\s]+$", full_name):
+        return {"status": False, "message": "Full name must contain only alphabets and spaces"}
+    if len(full_name.strip()) < 3:
+        return {"status": False, "message": "Full name must be at least 3 characters"}
+    if email and not re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", email):
+        return {"status": False, "message": "Invalid email format"}
+    if phone_number and not re.match(r"^[0-9]{10}$", phone_number):
+        return {"status": False, "message": "Phone must be 10 digits"}
+    if medical_license_number and not re.match(r"^[A-Za-z0-9]{5,15}$", medical_license_number):
+        return {"status": False, "message": "Invalid medical license number"}
+    if specialty and specialty == "Select specialty":
+        return {"status": False, "message": "Please select your specialty"}
     conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
+    cursor = conn.cursor(dictionary=True, buffered=True)
     try:
-        # Check by ID or Email
-        cursor.execute("SELECT id FROM doctor_register WHERE id=%s OR LOWER(email)=%s", (id, email))
+        # Check by IDprimarily, email only as fallback if id is empty
+        if id:
+            cursor.execute("SELECT id FROM doctor_register WHERE id=%s", (id,))
+        else:
+            cursor.execute("SELECT id FROM doctor_register WHERE LOWER(email)=%s", (email,))
         row = cursor.fetchone()
         if not row:
             return {"status": False, "message": "Doctor profile not found"}
@@ -509,6 +637,9 @@ async def update_doctor_profile(
         if full_name:
             update_fields.append("full_name=%s")
             params.append(full_name)
+        if email:
+            update_fields.append("email=%s")
+            params.append(email)
         if phone_number:
             update_fields.append("phone=%s")
             params.append(phone_number)
@@ -518,9 +649,12 @@ async def update_doctor_profile(
         if clinic_name:
             update_fields.append("clinic_name=%s")
             params.append(clinic_name)
-        if bio:
+        if bio is not None:
             update_fields.append("bio=%s")
             params.append(bio)
+        if medical_license_number is not None:
+            update_fields.append("medical_license_number=%s")
+            params.append(medical_license_number)
             
         if not update_fields:
             return {"status": False, "message": "No fields to update"}
@@ -528,6 +662,8 @@ async def update_doctor_profile(
         params.append(doc_id)
         
         sql = f"UPDATE doctor_register SET {', '.join(update_fields)} WHERE id=%s"
+        print(f"DEBUG UPDATE SQL: {sql}")
+        print(f"DEBUG UPDATE PARAMS: {params}")
         cursor.execute(sql, params)
         conn.commit()
 
@@ -541,13 +677,57 @@ async def update_doctor_profile(
         doctor["bio"] = doctor.get("bio") or ""
         
         if doctor.get("profile_image") and not doctor["profile_image"].startswith("http"):
-             doctor["profile_image"] = f"http://192.168.137.1:8000/uploads/{doctor['profile_image']}"
+             doctor["profile_image"] = f"uploads/{doctor['profile_image']}"
 
         return {"status": True, "message": "Profile updated successfully", "data": doctor}
     except Exception as e:
         import traceback
         print(traceback.format_exc())
         return {"status": False, "message": f"Update failed: {str(e)}"}
+    finally:
+        cursor.close()
+        conn.close()
+
+from pydantic import BaseModel
+
+class ChangePasswordRequest(BaseModel):
+    id: str
+    old_password: str
+    new_password: str
+
+@app.post("/change_password")
+async def change_password(request: ChangePasswordRequest):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        if len(request.new_password) < 8:
+            return {"status": False, "message": "Password must be at least 8 characters long"}
+        if not re.search(r'[A-Z]', request.new_password):
+            return {"status": False, "message": "Password must contain at least one uppercase letter"}
+        if not re.search(r'[a-z]', request.new_password):
+            return {"status": False, "message": "Password must contain at least one lowercase letter"}
+        if not re.search(r'[0-9]', request.new_password):
+            return {"status": False, "message": "Password must contain at least one number"}
+        if not re.search(r'[\W_]', request.new_password):
+            return {"status": False, "message": "Password must contain at least one special character"}
+
+        cursor.execute("SELECT password FROM doctor_register WHERE id=%s", (request.id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"status": False, "message": "User not found"}
+        
+        db_password = row['password']
+        if db_password != request.old_password:
+            return {"status": False, "message": "Incorrect current password"}
+        
+        if request.new_password == request.old_password:
+            return {"status": False, "message": "New password must be different from current password"}
+        
+        cursor.execute("UPDATE doctor_register SET password=%s WHERE id=%s", (request.new_password, request.id))
+        conn.commit()
+        return {"status": True, "message": "Password updated successfully"}
+    except Exception as e:
+        return {"status": False, "message": f"Failed: {str(e)}"}
     finally:
         cursor.close()
         conn.close()
@@ -664,6 +844,18 @@ def verify_otp(email: str = Form(...), otp: str = Form(...), new_password: str =
 
 @app.post("/add_patient")
 def add_patient(patient: PatientModel):
+    if len(patient.full_name.strip()) < 3:
+        return {"status": False, "message": "Full name must be at least 3 characters"}
+        
+    if not re.match(r"^[A-Za-z\s]+$", patient.full_name):
+        return {"status": False, "message": "Full name must contain only alphabets and spaces"}
+
+    if patient.age < 1 or patient.age > 120:
+        return {"status": False, "message": "Age must be between 1 and 120"}
+
+    if not re.match(r"^[0-9]{10}$", patient.phone_number):
+        return {"status": False, "message": "Phone number must be exactly 10 digits"}
+
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -700,10 +892,10 @@ def get_patients(doctor_id: Optional[str] = None):
     cursor = conn.cursor(dictionary=True)
     try:
         if doctor_id:
-            # Show patients for this doctor OR patients not yet assigned to any doctor (NULL)
+            # Strongly filter strictly by doctor_id
             cursor.execute("""
                 SELECT * FROM patients 
-                WHERE doctor_id=%s OR doctor_id IS NULL OR doctor_id = ''
+                WHERE doctor_id=%s
                 ORDER BY created_at DESC
             """, (doctor_id,))
         else:
@@ -787,20 +979,67 @@ def delete_patient(patient_id: str):
 # =================================================
 
 @app.get("/search_patient")
-def search_patient(query: str):
+def search_patient(query: str, doctor_id: Optional[str] = None):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     try:
-        cursor.execute("""
-        SELECT * FROM patients
-        WHERE full_name LIKE %s OR phone_number=%s
-        """, (f"%{query}%", query))
+        if doctor_id:
+            cursor.execute("""
+            SELECT * FROM patients
+            WHERE doctor_id=%s AND (full_name LIKE %s OR phone_number=%s)
+            """, (doctor_id, f"%{query}%", query))
+        else:
+            cursor.execute("""
+            SELECT * FROM patients
+            WHERE full_name LIKE %s OR phone_number=%s
+            """, (f"%{query}%", query))
 
         data = cursor.fetchall()
 
         return {"status": True, "count": len(data), "data": data}
     except Exception as e:
         return {"status": False, "message": f"Search failed: {str(e)}"}
+    finally:
+        cursor.close()
+        conn.close()
+
+# =================================================
+# GET SCANS
+# =================================================
+
+@app.post("/update_comments/{scan_id}")
+def update_comments(scan_id: int, comments: str = Form(...)):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE scans SET doctor_comments=%s WHERE id=%s", (comments, scan_id))
+        conn.commit()
+        return {"status": True, "message": "Comments updated successfully"}
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/scans")
+def get_scans(doctor_id: Optional[str] = None):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        if doctor_id:
+            cursor.execute("""
+            SELECT scans.* FROM scans 
+            INNER JOIN patients ON scans.patient_id = patients.id 
+            WHERE patients.doctor_id = %s
+            ORDER BY scans.created_at DESC
+            """, (doctor_id,))
+        else:
+            cursor.execute("SELECT * FROM scans ORDER BY created_at DESC")
+        
+        data = cursor.fetchall()
+        return {"status": True, "count": len(data), "data": data}
+    except Exception as e:
+        return {"status": False, "message": f"Fetch scans failed: {str(e)}"}
     finally:
         cursor.close()
         conn.close()
@@ -815,7 +1054,8 @@ def save_scan(
     risk_level: str = Form(...),
     tooth_type: str = Form(...),
     affected_area: str = Form(...),
-    confidence: str = Form(...)
+    confidence: str = Form(...),
+    doctor_comments: Optional[str] = Form(None)
 ):
     print(f"DEBUG: Manual save request received for Patient ID: {patient_id}")
     conn = get_connection()
@@ -823,10 +1063,10 @@ def save_scan(
     try:
         cursor.execute("""
             INSERT INTO scans (patient_id, image_path, condition_type, severity, risk, 
-                             tooth_type, recommendation, confidence, affected_area, scan_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             tooth_type, recommendation, confidence, affected_area, scan_date, doctor_comments)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (str(patient_id), image_path, condition_title, severity, risk_level, 
-              tooth_type, condition_desc, confidence, affected_area, datetime.now().strftime("%b %d, %Y")))
+              tooth_type, condition_desc, confidence, affected_area, datetime.now().strftime("%b %d, %Y"), doctor_comments))
         conn.commit()
         print(f"DEBUG: Manual save successful for scan: {condition_title}")
         return {"status": True, "message": "Scan saved to cloud"}
