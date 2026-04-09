@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, EmailStr, constr, field_validator
 import re
@@ -16,6 +17,14 @@ from PIL import Image
 from datetime import datetime
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Base directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -771,7 +780,7 @@ async def upload_profile_image_separate(
         cursor.execute("UPDATE doctor_register SET profile_image=%s WHERE id=%s", (image_filename, doc_id))
         conn.commit()
         
-        full_url = f"http://192.168.137.1:8000/uploads/{image_filename}"
+        full_url = f"http://180.235.121.253:8139/uploads/{image_filename}"
         return {"status": True, "message": "Image uploaded successfully", "image_url": full_url}
     except Exception as e:
         return {"status": False, "message": str(e)}
